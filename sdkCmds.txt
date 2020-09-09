@@ -1,0 +1,157 @@
+#
+# Copyright 2020 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#<!--* freshness: { owner: 'ttaggart@google.com' reviewed: '2020-sep-01' } *-->
+
+
+# This file lists the gcloud SDK commands to configure the resources in
+# the tutorial. The commands below use the env variables with a TF_VAR_
+# prefix that are set up in the reference guide.
+
+ 
+### Configure VPC & subnets ###
+gcloud compute networks create packetMirror-vpc \
+  --project="$TF_VAR_pid" \
+  --subnet-mode=custom
+ 
+gcloud compute networks subnets create webservers \
+  --project="$TF_VAR_pid" \
+  --network=packetMirror-vpc \
+  --region="$TF_VAR_region" \
+  --range=172.16.20.0/24
+ 
+gcloud compute networks subnets create collectors \
+  --project="$TF_VAR_pid" \
+  --network=packetMirror-vpc \
+  --region="$TF_VAR_region" \
+  --range=172.16.21.0/24
+
+
+### Configure firewall rules ###
+gcloud compute firewall-rules create allow-collector-ingress \
+  --project="$TF_VAR_pid" \
+  --network=packetMirror-vpc \
+  --direction=INGRESS \
+  --priority=1000 \
+  --action=ALLOW \
+  --rules=tcp,udp,icmp \
+  --source-ranges=0.0.0.0/0 \
+  --target-tags=collector
+
+gcloud compute firewall-rules create allow-ssh \
+  --project="$TF_VAR_pid" \
+  --network=packetMirror-vpc \
+  --direction=INGRESS \
+  --priority=1000 \
+  --action=ALLOW \
+  --rules=tcp:22 \
+  --source-ranges=35.235.240.0/20
+
+gcloud compute firewall-rules create fw-allow-health-check-and-proxy \
+  --project="$TF_VAR_pid" \
+  --network=packetMirror-vpc \
+  --direction=INGRESS \
+  --priority=1000 \
+  --action=ALLOW \
+  --rules=tcp:80,tcp:443 \
+  --source-ranges=35.191.0.0/16,130.211.0.0/22 \
+  --target-tags=webservers
+
+
+### Configure Cloud NAT ###
+gcloud compute routers create nat-router \
+  --project="$TF_VAR_pid" \
+  --network=packetMirror-vpc \
+  --region="$TF_VAR_region"
+
+gcloud compute routers nats create nat-config \
+  --project="$TF_VAR_pid" \
+  --router=nat-router \
+  --auto-allocate-nat-external-ips \
+  --nat-all-subnet-ip-ranges \
+  --enable-logging \
+  --region="$TF_VAR_region"
+
+
+### Create instance template ###
+gcloud compute instance-templates create webservers \
+  --project="$TF_VAR_pid" \
+  --region="$TF_VAR_region" \
+  --machine-type=n1-standard-1 \
+  --subnet=webservers \
+  --no-address \
+  --metadata=startup-script=\#\!\ /bin/bash$'\n'apt-get\ update$'\n'apt-get\ install\ -y\ apache2$'\n'echo\ \"Redirect\ 500\ /error500\"\ \|\ sudo\ tee\ -a\ /etc/apache2/apache2.conf$'\n'service\ apache2\ restart$'\n'cat\ \<\<EOF\ \>\ /var/www/html/index.html$'\n'\<html\>\<body\>\<h1\>Hello\ Packet\ Mirroring\ Application\ Performance\ Troubleshooting\ Solution\!\</h1\>$'\n'\</body\>\</html\> \
+  --maintenance-policy=MIGRATE \
+  --tags=webservers \
+  --image=debian-9-stretch-v20191115 \
+  --image-project=debian-cloud \
+  --boot-disk-size=10GB \
+  --boot-disk-type=pd-standard \
+  --boot-disk-device-name=webservers \
+  --reservation-affinity=any
+
+### Create instance group ###
+gcloud compute instance-groups managed create webservers \
+  --project="$TF_VAR_pid" \
+  --region="$TF_VAR_region" \
+  --base-instance-name=webservers \
+  --template=webservers \
+  --size=3 \
+  --zones=us-west1-a,us-west1-b,us-west1-c \
+  --instance-redistribution-type=PROACTIVE
+
+
+### Create Load Balancer ###
+gcloud compute addresses create lb-ipv4-1 \
+  --ip-version=IPV4 
+  --global
+
+### Configure Instance Groups ###
+gcloud compute instance-groups managed set-named-ports webservers \
+  --named-ports http:80 \
+   --region="$TF_VAR_region"
+
+### Create Health Check ###
+gcloud compute health-checks create http http-basic-check \
+    --port 80
+
+### Create Backend Services ###
+gcloud compute backend-services create packetMirror-backend \
+    --protocol HTTP \
+    --health-checks http-basic-check \
+    --global
+
+### Add Instance Group to Backend Service ###
+gcloud compute backend-services add-backend packetMirror-backend \
+    --balancing-mode=UTILIZATION \
+    --max-utilization=0.8 \
+    --capacity-scaler=1 \
+    --instance-group=webservers \
+    --instance-group-region=us-west1 \
+    --global
+
+### Create URL Map ###
+gcloud compute url-maps create http-lb \
+  --default-service packetMirror-backend
+
+### Set Target Proxy URL Map ###
+gcloud compute target-http-proxies create http-lb-proxy \
+  --url-map http-lb 
+
+### Create Forwarding Rule ###
+gcloud compute forwarding-rules create packetMirror-fr \
+    --global \
+    --target-http-proxy=http-lb-proxy \
+    --ports=80
